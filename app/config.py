@@ -45,6 +45,8 @@ class Settings:
     launch_at_startup: bool = False
     # Optional features
     allow_timezone_from_ip: bool = False
+    auto_timezone_enabled: bool = False
+    timezone_check_interval_sec: int = 60
     allow_region_from_ip: bool = False
     # UI/UX
     show_welcome_on_launch: bool = True  # show the help dialog on manual launch

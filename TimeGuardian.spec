@@ -39,7 +39,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['D:\\TimeGuardian\\logo.ico'],
+    icon=[SPECPATH + '/logo.ico'],
 )
 coll = COLLECT(
     exe,

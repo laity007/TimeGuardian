@@ -5,9 +5,8 @@ import struct
 import subprocess
 import sys
 from typing import List, Optional, Tuple, Dict, Set
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from PySide6.QtCore import QTimeZone
 
-import requests
 
 # Windows SYSTEMTIME for SetSystemTime (UTC)
 class SYSTEMTIME(ctypes.Structure):
@@ -33,7 +32,7 @@ def set_system_time_utc_via_helper(target_epoch_ms: int) -> Tuple[bool, str]:
         if os.path.isfile(candidate):
             helper = candidate
     if not os.path.isfile(helper):
-        return False, "Elevated helper not found."
+        return False, "未找到校时所需的管理员权限辅助程序。"
     python_exe = sys.executable
     cmd = [
         "powershell",
@@ -43,11 +42,11 @@ def set_system_time_utc_via_helper(target_epoch_ms: int) -> Tuple[bool, str]:
     ]
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        return True, "Elevation invoked (verification pending)."
+        return True, "已请求管理员权限执行校时，尚需确认是否校准成功。"
     except subprocess.TimeoutExpired:
-        return False, "Timed out requesting elevation."
+        return False, "请求管理员权限超时，请重试。"
     except Exception as e:
-        return False, f"Failed to invoke elevation: {e}"
+        return False, f"无法请求管理员权限： {e}"
 
 def list_windows_timezones() -> List[str]:
     try:
@@ -66,11 +65,20 @@ def get_current_timezone() -> str:
 def set_windows_timezone(tz_standard_name: str) -> Tuple[bool, str]:
     try:
         subprocess.check_call(["tzutil", "/s", tz_standard_name], timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
-        return True, f"Timezone set to {tz_standard_name}."
+        if get_current_timezone() != tz_standard_name:
+            return False, "系统未确认时区变更，请检查权限或 Windows 时区策略。"
+        return True, f"已将系统时区设为 {timezone_display_name(tz_standard_name)}。"
     except subprocess.CalledProcessError as e:
-        return False, f"Failed to set timezone: {e}"
+        return False, f"设置时区失败： {e}"
     except Exception as e:
-        return False, f"Error setting timezone: {e}"
+        return False, f"设置时区时发生异常： {e}"
+
+
+def timezone_display_name(key: str) -> str:
+    for zone in _enum_windows_time_zones_registry():
+        if zone["key"] == key:
+            return zone["display"] or key
+    return key
 
 def _format_utc_offset(minutes: int, with_space: bool = True) -> str:
     sign = "+" if minutes >= 0 else "-"
@@ -120,6 +128,13 @@ def _enum_windows_time_zones_registry() -> List[Dict]:
                         except Exception:
                             display = ""
                         try:
+                            resource, _ = winreg.QueryValueEx(k, "MUI_Display")
+                            localized = ctypes.create_unicode_buffer(1024)
+                            if ctypes.windll.shlwapi.SHLoadIndirectString(resource, localized, len(localized), None) == 0 and localized.value:
+                                display = localized.value
+                        except (OSError, AttributeError):
+                            pass
+                        try:
                             tzi_bytes, _ = winreg.QueryValueEx(k, "TZI")
                             bias, std_bias, dlt_bias, *rest = struct.unpack("<3l8H8H", tzi_bytes)
                             daylight_month = rest[8]
@@ -142,10 +157,18 @@ def _enum_windows_time_zones_registry() -> List[Dict]:
     return zones
 
 WIN_TO_IANA: Dict[str, str] = {
-    "UTC": "Etc/UTC",
-    "Iran Standard Time": "Asia/Tehran",
-    # ... (mapping as in previous version, omitted here for brevity; keep the full mapping in your file)
+    zone["key"]: bytes(QTimeZone.windowsIdToDefaultIanaId(zone["key"].encode("utf-8"))).decode("utf-8")
+    for zone in _enum_windows_time_zones_registry()
 }
+
+
+def iana_to_windows(iana: str) -> str:
+    aliases = {"US/Pacific": "America/Los_Angeles", "US/Eastern": "America/New_York", "UTC": "Etc/UTC"}
+    encoded = aliases.get(iana, iana).encode("utf-8")
+    key = bytes(QTimeZone.ianaIdToWindowsId(encoded)).decode("utf-8")
+    if not QTimeZone(encoded).isValid() or not key or key not in WIN_TO_IANA:
+        raise ValueError(f"无法将 {iana} 映射到本机支持的 Windows 时区。")
+    return key
 
 def windows_key_to_iana(key: str) -> Optional[str]:
     return WIN_TO_IANA.get(key)
@@ -164,14 +187,9 @@ def list_timezone_choices_labels() -> List[Tuple[str, str]]:
         key = z["key"]
         off = z["offset_minutes"]
         label_off = _format_utc_offset(off)
-        iana = windows_key_to_iana(key)
-        if iana:
-            city, area = iana_city_region(iana)
-            label = f"(UTC {label_off[4:]}) {city}/{area}" if area else f"(UTC {label_off[4:]}) {city}"
-        else:
-            disp = z["display"]
-            city_part = disp.split(")", 1)[1].strip() if ")" in disp else disp
-            label = f"(UTC {label_off[4:]}) {city_part}"
+        disp = z["display"]
+        city_part = disp.split(")", 1)[1].strip() if ")" in disp else disp
+        label = f"(UTC {label_off[4:]}) {city_part}"
         if key not in seen:
             items.append((label, key))
             seen.add(key)
@@ -184,96 +202,13 @@ def list_timezone_choices_labels() -> List[Tuple[str, str]]:
     return items
 
 def get_timezone_from_ip_modern(timeout_sec: float = 5.0, overall_timeout_sec: float = 8.0) -> Tuple[Optional[str], Optional[int]]:
-    headers = {"User-Agent": "TimeGuardian/1.0"}
+    # Compatibility entry point; all IP-based operations now require consensus.
+    from app.timezone_follow import GeoResolver
+    from PySide6.QtCore import QDateTime
+    result = GeoResolver().lookup()
+    zone = QTimeZone(result.iana.encode("utf-8"))
+    return result.iana, zone.offsetFromUtc(QDateTime.currentDateTimeUtc()) // 60
 
-    def p_ipapi():
-        r = requests.get("https://ipapi.co/json/", timeout=timeout_sec, headers=headers)
-        if r.status_code == 200:
-            j = r.json()
-            iana = j.get("timezone")
-            uo = j.get("utc_offset")
-            off = None
-            if isinstance(uo, str) and len(uo) in (5, 6):
-                sign = 1 if uo[0] == "+" else -1
-                hh = int(uo[1:3]); mm = int(uo[-2:])
-                off = sign * (hh * 60 + mm)
-            return iana, off
-        raise RuntimeError("ipapi.co failed")
-
-    def p_ipapi_com():
-        r = requests.get("http://ip-api.com/json", timeout=timeout_sec, headers=headers)
-        if r.status_code == 200:
-            j = r.json()
-            iana = j.get("timezone")
-            off_sec = j.get("offset")
-            off = int(off_sec // 60) if isinstance(off_sec, int) else None
-            return iana, off
-        raise RuntimeError("ip-api.com failed")
-
-    def p_ipwho():
-        r = requests.get("https://ipwho.is/", timeout=timeout_sec, headers=headers)
-        if r.status_code == 200:
-            j = r.json()
-            tz = j.get("timezone") or {}
-            iana = tz.get("id")
-            off_sec = tz.get("offset")
-            off = int(off_sec // 60) if isinstance(off_sec, (int, float)) else None
-            return iana, off
-        raise RuntimeError("ipwho.is failed")
-
-    def p_worldtimeapi():
-        r = requests.get("https://worldtimeapi.org/api/ip", timeout=timeout_sec, headers=headers)
-        if r.status_code == 200:
-            j = r.json()
-            iana = j.get("timezone")
-            uo = j.get("utc_offset")
-            off = None
-            if isinstance(uo, str) and len(uo) == 6 and uo[3] == ":":
-                sign = 1 if uo[0] == "+" else -1
-                hh = int(uo[1:3]); mm = int(uo[4:6])
-                off = sign * (hh * 60 + mm)
-            return iana, off
-        raise RuntimeError("worldtimeapi failed")
-
-    def p_ifconfig():
-        r = requests.get("https://ifconfig.co/json", timeout=timeout_sec, headers=headers)
-        if r.status_code == 200:
-            j = r.json()
-            iana = j.get("timezone")
-            return iana, None
-        raise RuntimeError("ifconfig.co failed")
-
-    def p_ip_sb():
-        r = requests.get("https://api.ip.sb/geoip", timeout=timeout_sec, headers=headers)
-        if r.status_code == 200:
-            j = r.json()
-            iana = j.get("timezone")
-            off_sec = j.get("offset")
-            off = int(off_sec // 60) if isinstance(off_sec, (int, float)) else None
-            return iana, off
-        raise RuntimeError("ip.sb failed")
-
-    providers = [p_ipapi, p_ipapi_com, p_ipwho, p_worldtimeapi, p_ifconfig, p_ip_sb]
-
-    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-    with ThreadPoolExecutor(max_workers=len(providers)) as ex:
-        futures = [ex.submit(p) for p in providers]
-        done, not_done = wait(futures, timeout=overall_timeout_sec, return_when=FIRST_COMPLETED)
-        for d in done:
-            try:
-                iana, off = d.result()
-                if iana or off is not None:
-                    return iana, off
-            except Exception:
-                continue
-        for f in futures:
-            try:
-                iana, off = f.result(timeout=0.1)
-                if iana or off is not None:
-                    return iana, off
-            except Exception:
-                pass
-    return None, None
 
 def get_timezone_offset_from_ip(timeout_sec: float = 5.0) -> Optional[int]:
     iana, off = get_timezone_from_ip_modern(timeout_sec=timeout_sec)
@@ -294,17 +229,17 @@ def _best_zone_for_offset(offset_minutes: int) -> Optional[str]:
 
 def set_timezone_by_utc_label(label: str) -> Tuple[bool, str]:
     if not label.upper().startswith("UTC"):
-        return False, "Invalid UTC label."
+        return False, "时区偏移必须以 UTC 开头。"
     try:
         s = label[3:].strip()
         sign = 1 if s[0] == "+" else -1
         hh, mm = s[1:].split(":")
         minutes = sign * (int(hh) * 60 + int(mm))
     except Exception:
-        return False, "Invalid UTC label format."
+        return False, "时区偏移格式无效，请使用 UTC+08:00 这样的格式。"
     key = _best_zone_for_offset(minutes)
     if not key:
-        return False, f"No timezone found for UTC{label[3:]}."
+        return False, f"未找到与 UTC{label[3:]} 对应的 Windows 时区。"
     return set_windows_timezone(key)
 
 def set_region_from_country_code(country_code: str) -> Tuple[bool, str]:
@@ -353,7 +288,7 @@ if ($ok1 -or $ok2) { exit 0 } else { exit 1 }
             tf.write(ps_script)
             script_path = tf.name
     except Exception as e:
-        return False, f"Failed to create temp script: {e}"
+        return False, f"无法创建调整地区设置所需的临时脚本： {e}"
     cmd = [
         "powershell",
         "-ExecutionPolicy", "Bypass",
@@ -363,10 +298,10 @@ if ($ok1 -or $ok2) { exit 0 } else { exit 1 }
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=20)
     except subprocess.TimeoutExpired:
-        return False, "Timed out requesting elevation for region change."
+        return False, "调整地区设置时，请求管理员权限超时。"
     except Exception as e:
-        return False, f"Failed to invoke elevation: {e}"
-    return True, "Region change requested (verification pending)."
+        return False, f"无法请求管理员权限： {e}"
+    return True, "已请求调整 Windows 地区和区域格式，请在系统设置中确认结果。"
 
 def register_startup(app_name: str, exe_path: str, enable: bool) -> Tuple[bool, str]:
     """
@@ -374,24 +309,30 @@ def register_startup(app_name: str, exe_path: str, enable: bool) -> Tuple[bool, 
     Writes a --startup flag to allow the app to detect startup launches and suppress the welcome dialog.
     """
     if not is_windows():
-        return False, "Startup registration is only available on Windows."
+        return False, "登录自启动仅支持 Windows。"
     try:
         import winreg  # type: ignore
     except Exception:
-        return False, "winreg not available."
+        return False, "无法使用 Windows 注册表组件，未能设置自启动。"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",
                             0, winreg.KEY_ALL_ACCESS) as key:
             if enable:
-                value = f"\"{exe_path}\" --startup"
+                if getattr(sys, "frozen", False):
+                    value = subprocess.list2cmdline([exe_path, "--startup"])
+                else:
+                    pythonw = os.path.join(os.path.dirname(exe_path), "pythonw.exe")
+                    interpreter = pythonw if os.path.isfile(pythonw) else exe_path
+                    launcher = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "launch.py"))
+                    value = subprocess.list2cmdline([interpreter, launcher, "--startup"])
                 winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, value)
-                return True, "Startup enabled."
+                return True, "已开启登录自启动。"
             else:
                 try:
                     winreg.DeleteValue(key, app_name)
                 except FileNotFoundError:
                     pass
-                return True, "Startup disabled."
+                return True, "已关闭登录自启动。"
     except Exception as e:
-        return False, f"Failed to update startup: {e}"
+        return False, f"更新自启动设置失败： {e}"

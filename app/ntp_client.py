@@ -17,7 +17,7 @@ class NtpResult:
         self.rtt_ms = rtt_ms
         self.offset_ms = offset_ms
         self.success = success
-        self.error = error  # when not None, includes reason or fallback method (e.g., "ICMP fallback")
+        self.error = error  # when not None, includes reason or fallback method (e.g., "已改用 ICMP 测试延迟")
 
 def _system_to_ntp_time(timestamp: float) -> float:
     return timestamp + NTP_DELTA
@@ -61,12 +61,13 @@ def query_ntp_once(server: str, timeout_ms: int = 800) -> NtpResult:
         t4_sys = time.time()
     except Exception as e:
         sock.close()
-        return NtpResult(server, rtt_ms=0, offset_ms=0, success=False, error=str(e))
+        error = "连接校时服务器超时" if isinstance(e, TimeoutError) else f"无法连接校时服务器：{e}"
+        return NtpResult(server, rtt_ms=0, offset_ms=0, success=False, error=error)
     finally:
         sock.close()
 
     if len(data) < 48:
-        return NtpResult(server, rtt_ms=0, offset_ms=0, success=False, error="Short NTP response")
+        return NtpResult(server, rtt_ms=0, offset_ms=0, success=False, error="服务器返回的 NTP 数据不完整")
 
     unpacked = struct.unpack("!B B b b 11I", data)
     recv_sec = unpacked[9]
@@ -110,7 +111,7 @@ def query_ntp(server: str, timeout_ms: int = 800, samples: int = 1) -> NtpResult
         offsets = [r.offset_ms for r in results]
         return NtpResult(server, rtt_ms=float(statistics.median(rtts)),
                          offset_ms=float(statistics.median(offsets)), success=True)
-    return NtpResult(server, rtt_ms=0.0, offset_ms=0.0, success=False, error=last_err or "NTP failed")
+    return NtpResult(server, rtt_ms=0.0, offset_ms=0.0, success=False, error=last_err or "NTP 校时请求失败")
 
 def _icmp_ping_windows(host: str, timeout_ms: int = 800, samples: int = 3) -> Optional[float]:
     """
@@ -162,9 +163,9 @@ def ping_servers(
             else:
                 icmp_rtt = _icmp_ping_windows(server, timeout_ms=timeout_ms, samples=max(2, samples))
                 if icmp_rtt is not None:
-                    results[idx] = NtpResult(server, rtt_ms=icmp_rtt, offset_ms=0.0, success=False, error="ICMP fallback")
+                    results[idx] = NtpResult(server, rtt_ms=icmp_rtt, offset_ms=0.0, success=False, error="已改用 ICMP 测试延迟")
                 else:
-                    results[idx] = NtpResult(server, rtt_ms=0.0, offset_ms=0.0, success=False, error=ntp_res.error or "NTP failed")
+                    results[idx] = NtpResult(server, rtt_ms=0.0, offset_ms=0.0, success=False, error=ntp_res.error or "NTP 校时请求失败")
         with lock:
             done_count += 1
             if progress_cb:
@@ -181,4 +182,4 @@ def ping_servers(
     for t in threads:
         t.join()
 
-    return [r if r is not None else NtpResult(servers[i], 0.0, 0.0, False, "Unknown") for i, r in enumerate(results)]
+    return [r if r is not None else NtpResult(servers[i], 0.0, 0.0, False, "原因未知") for i, r in enumerate(results)]

@@ -74,8 +74,8 @@ def set_system_time_utc(epoch_ms: int) -> bool:
     return ok != 0
 
 def main():
-    parser = argparse.ArgumentParser(description="Elevated helper to set Windows system UTC time.")
-    parser.add_argument("--set-utc-epoch-ms", type=int, required=True, help="Target UTC time in milliseconds since Unix epoch.")
+    parser = argparse.ArgumentParser(description="以管理员权限校准 Windows 系统时间。")
+    parser.add_argument("--set-utc-epoch-ms", type=int, required=True, help="目标 UTC 时间，以 Unix 时间戳的毫秒数表示。")
     args = parser.parse_args()
 
     if set_system_time_utc(args.set_utc_epoch_ms):

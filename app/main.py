@@ -18,6 +18,8 @@ from app.config import Config, Settings, APP_NAME
 from app.ntp_client import query_ntp, NtpResult, ping_servers
 from app.icons import connected_icon, disconnected_icon, idle_icon, default_app_icon, github_icon, star_icon
 from app import time_utils
+from app.localization import configure_chinese
+from app.timezone_follow import TimezoneFollower
 import requests
 
 # Thread-safe flags and shared state
@@ -83,11 +85,11 @@ class NtpSyncManager:
         threshold_ms = self.cfg.settings.drift_threshold_ms
         drift = selected.offset_ms
         if abs(drift) < threshold_ms:
-            return False, f"Drift {drift:.1f} ms within threshold ({threshold_ms} ms)"
+            return False, f"当前时差为 {drift:.1f} 毫秒，未达到校时阈值（{threshold_ms} 毫秒），无需调整。"
         now_epoch = time.time()
         target_epoch_ms = int((now_epoch + (drift / 1000.0)) * 1000)
         ok, msg = time_utils.set_system_time_utc_via_helper(target_epoch_ms)
-        return ok, f"Time correction requested ({drift:.1f} ms drift). {msg}"
+        return ok, f"本次时差为 {drift:.1f} 毫秒。{msg}"
 
     def _run_loop(self):
         self.state.running = True
@@ -100,7 +102,7 @@ class NtpSyncManager:
                 try:
                     selected = self._choose_server(self.cfg.settings.ntp_timeout_ms)
                     if not selected:
-                        self.state.last_result = NtpResult(server="(none)", rtt_ms=0, offset_ms=0, success=False, error="No server available")
+                        self.state.last_result = NtpResult(server="（无）", rtt_ms=0, offset_ms=0, success=False, error="没有可用的校时服务器")
                         if self.on_status_changed:
                             self.on_status_changed()
                         time.sleep(self.cfg.settings.check_interval_sec)
@@ -122,7 +124,7 @@ class NtpSyncManager:
                         self.state.last_success_time = time.time()
 
                 except Exception as e:
-                    self.state.last_result = NtpResult(server="(error)", rtt_ms=0, offset_ms=0, success=False, error=str(e))
+                    self.state.last_result = NtpResult(server="（异常）", rtt_ms=0, offset_ms=0, success=False, error=f"校时过程中发生异常：{e}")
 
                 if self.on_status_changed:
                     self.on_status_changed()
@@ -143,7 +145,7 @@ class WelcomeDialog(QDialog):
     def __init__(self, cfg: Config, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.cfg = cfg
-        self.setWindowTitle("Welcome to TimeGuardian")
+        self.setWindowTitle("欢迎使用 TimeGuardian")
         self.setModal(True)
         self.setMinimumWidth(460)
         self.setStyleSheet("""
@@ -152,6 +154,9 @@ class WelcomeDialog(QDialog):
                 color: #e2e8f0;
                 border: 1px solid #334155;
                 border-radius: 10px;
+            }
+            QLabel, QCheckBox {
+                color: #e2e8f0;
             }
             QLabel#title {
                 color: #93c5fd;
@@ -177,22 +182,22 @@ class WelcomeDialog(QDialog):
             }
         """)
         v = QVBoxLayout(self)
-        title = QLabel("TimeGuardian is running in your tray")
+        title = QLabel("TimeGuardian 已在托盘中运行")
         title.setObjectName("title")
         v.addWidget(title)
         body = QLabel(
-            "You can find the TimeGuardian icon in the Windows system tray (near the clock).\n"
-            "Right-click the icon for Settings, time sync, and timezone tools.\n\n"
-            "Icon states:\n"
-            "• Blue (dot) = starting/idle\n"
-            "• Green (check) = connected/recently synced\n"
-            "• Red (cross) = not recently synced\n\n"
-            "Tip: You can disable this welcome dialog for future manual launches in Settings."
+            "程序图标位于任务栏右下角的通知区域，可能收在折叠菜单中。\n"
+            "右键点击图标，即可打开设置、立即校时或调整时区。\n\n"
+            "图标状态：\n"
+            "• 蓝色圆点：尚未校时或正在等待\n"
+            "• 绿色对勾：最近校时正常\n"
+            "• 红色叉号：最近未能完成校时\n\n"
+            "可在设置中关闭此欢迎提示。登录自启动时不会弹出本窗口。"
         )
         body.setObjectName("body")
         body.setWordWrap(True)
         v.addWidget(body)
-        self.chk_dont_show = QCheckBox("Don't show this dialog on manual launch again")
+        self.chk_dont_show = QCheckBox("以后手动启动时不再显示")
         self.chk_dont_show.setChecked(False)
         v.addWidget(self.chk_dont_show)
         v.addSpacing(6)
@@ -214,38 +219,43 @@ class SettingsDialog(QDialog):
     ping_results_ready = Signal(list)   # list of dicts: {'server': str, 'rtt': float or None, 'method': 'NTP'|'ICMP'|'fail'}
     ping_progress = Signal(int, int)    # done, total
 
-    def __init__(self, cfg: Config, parent: Optional[QWidget] = None):
+    def __init__(self, cfg: Config, parent: Optional[QWidget] = None, follow_status="尚未检查"):
         super().__init__(parent)
-        self.setWindowTitle(f"{APP_NAME} Settings")
+        self.setWindowTitle(f"{APP_NAME} 设置")
+        self.setMinimumWidth(620)
         self.cfg = cfg
 
         layout = QVBoxLayout(self)
 
         # Auto sync
-        self.chk_auto = QCheckBox("Enable automatic sync")
+        self.chk_auto = QCheckBox("定期自动校时")
+        self.chk_auto.setToolTip("定期检查系统时间，仅在时差达到阈值时校正；此选项不会自动切换时区。")
         self.chk_auto.setChecked(cfg.settings.auto_sync_enabled)
         layout.addWidget(self.chk_auto)
 
         # Interval
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Check interval (seconds):"))
+        row1.addWidget(QLabel("校时检查间隔："))
         self.spin_interval = QSpinBox()
         self.spin_interval.setRange(30, 86400)
         self.spin_interval.setValue(cfg.settings.check_interval_sec)
+        self.spin_interval.setSuffix(" 秒")
         row1.addWidget(self.spin_interval)
         layout.addLayout(row1)
 
         # Threshold
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Drift threshold (ms):"))
+        row2.addWidget(QLabel("校时阈值："))
         self.spin_threshold = QSpinBox()
         self.spin_threshold.setRange(10, 60000)
         self.spin_threshold.setValue(cfg.settings.drift_threshold_ms)
+        self.spin_threshold.setSuffix(" 毫秒")
+        self.spin_threshold.setToolTip("系统时间与服务器时间相差达到此值时，才会尝试校正。")
         row2.addWidget(self.spin_threshold)
         layout.addLayout(row2)
 
         # Server list and controls
-        layout.addWidget(QLabel("NTP servers (one per line):"))
+        layout.addWidget(QLabel("NTP 校时服务器："))
         self.list_servers = QListWidget()
         for s in cfg.settings.ntp_servers:
             self.list_servers.addItem(QListWidgetItem(s))
@@ -276,10 +286,10 @@ class SettingsDialog(QDialog):
 
         row3 = QHBoxLayout()
         self.txt_new_server = QLineEdit()
-        self.txt_new_server.setPlaceholderText("Add server (e.g., time.google.com)")
-        self.btn_add = QPushButton("Add")
-        self.btn_remove = QPushButton("Remove Selected")
-        self.btn_ping = QPushButton("Ping servers")
+        self.txt_new_server.setPlaceholderText("服务器地址，例如 time.google.com")
+        self.btn_add = QPushButton("添加")
+        self.btn_remove = QPushButton("移除所选")
+        self.btn_ping = QPushButton("测试延迟")
         row3.addWidget(self.txt_new_server)
         row3.addWidget(self.btn_add)
         row3.addWidget(self.btn_remove)
@@ -290,41 +300,61 @@ class SettingsDialog(QDialog):
         self.btn_ping.clicked.connect(self._ping_servers)
 
         # Auto vs Preferred
-        self.chk_auto_select = QCheckBox("Auto-select best server (by lowest latency)")
+        self.chk_auto_select = QCheckBox("自动选择延迟最低的可用服务器")
         self.chk_auto_select.setChecked(cfg.settings.auto_select_server)
         layout.addWidget(self.chk_auto_select)
 
         row4 = QHBoxLayout()
-        row4.addWidget(QLabel("Preferred server (used when Auto-select is off):"))
+        row4.addWidget(QLabel("首选服务器："))
         self.txt_preferred = QLineEdit()
         self.txt_preferred.setText(cfg.settings.preferred_server or "")
+        self.txt_preferred.setToolTip("关闭自动选择后，优先使用此服务器。")
         row4.addWidget(self.txt_preferred)
-        self.btn_set_from_selection = QPushButton("Set from selection")
+        self.btn_set_from_selection = QPushButton("将所选设为首选")
         row4.addWidget(self.btn_set_from_selection)
         layout.addLayout(row4)
         self.btn_set_from_selection.clicked.connect(self._set_preferred_from_selection)
 
         # Startup
-        self.chk_startup = QCheckBox("Launch at Windows startup")
+        self.chk_startup = QCheckBox("登录 Windows 后自动启动")
         self.chk_startup.setChecked(cfg.settings.launch_at_startup)
         layout.addWidget(self.chk_startup)
 
         # Optional features
-        self.chk_tz_ip = QCheckBox("Allow timezone set based on public IP (optional)")
+        self.chk_tz_auto = QCheckBox("自动跟随代理出口时区")
+        self.chk_tz_auto.setChecked(cfg.settings.auto_timezone_enabled)
+        self.chk_tz_auto.setToolTip("至少两个查询来源一致，且连续两轮检测到同一出口后切换。查询失败或无共识时保留当前时区。")
+        layout.addWidget(self.chk_tz_auto)
+        timezone_row = QHBoxLayout()
+        timezone_row.addWidget(QLabel("时区检查间隔："))
+        self.spin_tz_interval = QSpinBox()
+        self.spin_tz_interval.setRange(30, 3600)
+        self.spin_tz_interval.setSuffix(" 秒")
+        self.spin_tz_interval.setValue(cfg.settings.timezone_check_interval_sec)
+        timezone_row.addWidget(self.spin_tz_interval)
+        layout.addLayout(timezone_row)
+        self.follow_status = QLabel(follow_status)
+        self.follow_status.setWordWrap(True)
+        self.follow_status.setTextFormat(Qt.PlainText)
+        layout.addWidget(self.follow_status)
+
+        self.chk_tz_ip = QCheckBox("允许手动根据公网 IP 设置时区")
+        self.chk_tz_ip.setToolTip("可从托盘菜单立即查询并设置时区；仍须至少两个查询来源一致。自动跟随由上方独立开关控制。")
         self.chk_tz_ip.setChecked(cfg.settings.allow_timezone_from_ip)
         layout.addWidget(self.chk_tz_ip)
 
-        self.chk_region_ip = QCheckBox("Allow Windows region change based on public IP (optional, may require reboot)")
+        self.chk_region_ip = QCheckBox("允许根据公网 IP 调整 Windows 地区和区域格式（可能需要重启）")
+        self.chk_region_ip.setToolTip("会尝试更改 Windows 所在国家或地区，以及日期、数字等区域格式。")
         self.chk_region_ip.setChecked(cfg.settings.allow_region_from_ip)
         layout.addWidget(self.chk_region_ip)
 
         # Notifications
-        self.chk_notifications = QCheckBox("Enable notifications (tray balloons)")
+        self.chk_notifications = QCheckBox("显示托盘通知")
         self.chk_notifications.setChecked(cfg.settings.notifications_enabled)
         layout.addWidget(self.chk_notifications)
 
         # Welcome dialog visibility on manual launch
-        self.chk_show_welcome = QCheckBox("Show welcome dialog on manual launch")
+        self.chk_show_welcome = QCheckBox("手动启动时显示欢迎提示")
         self.chk_show_welcome.setChecked(cfg.settings.show_welcome_on_launch)
         layout.addWidget(self.chk_show_welcome)
 
@@ -351,9 +381,9 @@ class SettingsDialog(QDialog):
     def _set_preferred_from_selection(self):
         items = self.list_servers.selectedItems()
         if not items:
-            QMessageBox.information(self, APP_NAME, "Select a server first.")
+            QMessageBox.information(self, APP_NAME, "请先在列表中选择一台服务器。")
             return
-        self.txt_preferred.setText(items[0].text())
+        self.txt_preferred.setText(items[0].data(Qt.UserRole) or items[0].text())
 
     def _on_ping_progress(self, done: int, total: int):
         if total <= 0:
@@ -362,17 +392,17 @@ class SettingsDialog(QDialog):
             self.pbar.setVisible(True)
         self.pbar.setMaximum(total)
         self.pbar.setValue(done)
-        self.pbar.setFormat(f"Pinging servers... {done}/{total}")
+        self.pbar.setFormat(f"正在测试延迟… {done}/{total}")
 
     def _ping_servers(self):
         # Disable only the ping button during the operation
         self.btn_ping.setEnabled(False)
         self.pbar.setVisible(True)
         self.pbar.setValue(0)
-        self.pbar.setFormat("Pinging servers... 0/0")
+        self.pbar.setFormat("正在测试延迟… 0/0")
         def work():
             try:
-                servers = [self.list_servers.item(i).text().split(" (RTT:")[0].strip()
+                servers = [(self.list_servers.item(i).data(Qt.UserRole) or self.list_servers.item(i).text()).strip()
                            for i in range(self.list_servers.count())
                            if self.list_servers.item(i).text().strip()]
                 if not servers:
@@ -402,7 +432,7 @@ class SettingsDialog(QDialog):
         # Hide progress at the end
         self.pbar.setVisible(False)
         if not payload:
-            QMessageBox.information(self, APP_NAME, "No servers to ping.")
+            QMessageBox.information(self, APP_NAME, "列表为空，请先添加校时服务器。")
             return
         # Sort by numeric RTT (None => inf)
         def rtt_val(entry):
@@ -413,44 +443,48 @@ class SettingsDialog(QDialog):
         reachable = 0
         for entry in sorted_payload:
             server = entry["server"]
-            method = entry["method"]
+            method = "未响应" if entry["method"] == "fail" else entry["method"]
             if entry["rtt"] is None:
-                label = f"{server} (RTT: fail)"
+                label = f"{server}（测试失败）"
             else:
-                label = f"{server} (RTT: {entry['rtt']:.0f} ms {method}, median of 5)"
+                label = f"{server}（延迟：{entry['rtt']:.0f} 毫秒，{method}，5 次采样的中位数）"
                 reachable += 1
-            self.list_servers.addItem(QListWidgetItem(label))
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, server)
+            self.list_servers.addItem(item)
         # Save ping summary and also update stored server order to the sorted order
         self.cfg.settings.last_ping_results = {
             e["server"]: (float(e["rtt"]) if isinstance(e["rtt"], (int, float)) else 0.0)
             for e in sorted_payload
         }
-        self.cfg.settings.ntp_servers = [self.list_servers.item(i).text().split(" (RTT:")[0].strip()
+        self.cfg.settings.ntp_servers = [(self.list_servers.item(i).data(Qt.UserRole) or self.list_servers.item(i).text()).strip()
                                          for i in range(self.list_servers.count())]
         self.cfg.save()
         # Inform the user which server is currently the best by ping
         best = next((e for e in sorted_payload if isinstance(e["rtt"], (int, float))), None)
         if best:
-            QMessageBox.information(self, APP_NAME, f"Best by latency: {best['server']} ({best['rtt']:.0f} ms, {best['method']}, median of 5).\n"
-                                                    f"You can set it as Preferred or leave Auto-select enabled.")
+            QMessageBox.information(self, APP_NAME, f"本次延迟最低的服务器：{best['server']}\n延迟：{best['rtt']:.0f} 毫秒（{best['method']}，5 次采样的中位数）。\n\n"
+                                                    f"可将其设为首选，也可以继续使用自动选择。")
         else:
-            QMessageBox.information(self, APP_NAME, "Ping complete, but no servers were reachable.")
+            QMessageBox.information(self, APP_NAME, "测试完成，所有服务器均未响应。请检查网络连接或更换服务器。")
 
     def accept(self):
         s = self.cfg.settings
         s.auto_sync_enabled = self.chk_auto.isChecked()
         s.check_interval_sec = int(self.spin_interval.value())
         s.drift_threshold_ms = int(self.spin_threshold.value())
-        s.ntp_servers = [self.list_servers.item(i).text().split(" (RTT:")[0].strip()
+        s.ntp_servers = [(self.list_servers.item(i).data(Qt.UserRole) or self.list_servers.item(i).text()).strip()
                          for i in range(self.list_servers.count())
                          if self.list_servers.item(i).text().strip()]
         if not s.ntp_servers:
-            QMessageBox.warning(self, "Validation", "You must specify at least one NTP server.")
+            QMessageBox.warning(self, "无法保存设置", "请至少添加一台 NTP 校时服务器。")
             return
         s.auto_select_server = self.chk_auto_select.isChecked()
         s.preferred_server = self.txt_preferred.text().strip()
         s.launch_at_startup = self.chk_startup.isChecked()
         s.allow_timezone_from_ip = self.chk_tz_ip.isChecked()
+        s.auto_timezone_enabled = self.chk_tz_auto.isChecked()
+        s.timezone_check_interval_sec = self.spin_tz_interval.value()
         s.allow_region_from_ip = self.chk_region_ip.isChecked()
         s.show_welcome_on_launch = self.chk_show_welcome.isChecked()
         s.notifications_enabled = self.chk_notifications.isChecked()
@@ -463,6 +497,7 @@ class TrayApp:
     """
     def __init__(self):
         self.app = QApplication(sys.argv)
+        configure_chinese(self.app)
         # Brand the app so notifications don't say "Python"
         try:
             self.app.setApplicationName("TG")
@@ -476,7 +511,7 @@ class TrayApp:
         self.app.setQuitOnLastWindowClosed(False)
 
         if not QSystemTrayIcon.isSystemTrayAvailable():
-            QMessageBox.critical(None, APP_NAME, "System tray is not available on this system session.")
+            QMessageBox.critical(None, APP_NAME, "当前 Windows 会话不支持系统托盘，程序无法运行。")
             sys.exit(1)
 
         # Detect startup mode via '--startup' flag
@@ -484,6 +519,10 @@ class TrayApp:
 
         self.cfg = Config()
         self.state = SyncState()
+        self.timezone_follower = TimezoneFollower(self.cfg)
+        self.timezone_follower.notice.connect(
+            lambda text, error: self._notify(text, QSystemTrayIcon.Warning if error else QSystemTrayIcon.Information, 6000)
+        )
 
         # Use default app icon (logo.png if present) for app window icon
         try:
@@ -500,7 +539,7 @@ class TrayApp:
 
         # Tray and menu
         self.tray = QSystemTrayIcon()
-        self.tray.setToolTip(f"{APP_NAME} - Time synchronization")
+        self.tray.setToolTip(f"{APP_NAME} · 时间校准")
 
         # Ensure a visible default icon (logo or idle) before showing tray
         try:
@@ -513,11 +552,11 @@ class TrayApp:
 
         self.menu = QMenu()
 
-        self.action_sync_now = QAction("Sync now")
+        self.action_sync_now = QAction("立即校时")
         self.action_sync_now.triggered.connect(self.sync_now)
         self.menu.addAction(self.action_sync_now)
 
-        self.action_auto = QAction("Enable automatic sync")
+        self.action_auto = QAction("定期自动校时")
         self.action_auto.setCheckable(True)
         self.action_auto.setChecked(self.cfg.settings.auto_sync_enabled)
         self.action_auto.triggered.connect(self.toggle_auto_sync)
@@ -525,7 +564,7 @@ class TrayApp:
 
         self.menu.addSeparator()
 
-        self.action_startup = QAction("Start at Windows login")
+        self.action_startup = QAction("登录后自动启动")
         self.action_startup.setCheckable(True)
         self.action_startup.setChecked(self.cfg.settings.launch_at_startup)
         self.action_startup.triggered.connect(self.toggle_startup)
@@ -533,38 +572,47 @@ class TrayApp:
 
         self.menu.addSeparator()
 
-        self.action_set_tz = QAction("Set timezone (UTC offset with city/region)...")
+        self.action_set_tz = QAction("手动选择时区…")
         self.action_set_tz.triggered.connect(self.set_timezone_dialog)
         self.menu.addAction(self.action_set_tz)
 
-        self.action_tz_from_ip = QAction("Set timezone from IP (modern, multi-source)")
+        self.action_tz_from_ip = QAction("根据公网 IP 设置时区")
         self.action_tz_from_ip.triggered.connect(self.set_timezone_from_ip)
         self.menu.addAction(self.action_tz_from_ip)
 
-        self.action_region_from_ip = QAction("Set Windows region from IP (optional)")
+        self.action_auto_timezone = QAction("自动跟随代理出口时区")
+        self.action_auto_timezone.setCheckable(True)
+        self.action_auto_timezone.setChecked(self.cfg.settings.auto_timezone_enabled)
+        self.action_auto_timezone.triggered.connect(self.toggle_auto_timezone)
+        self.menu.addAction(self.action_auto_timezone)
+        self.action_timezone_status = QAction("查看时区跟随状态…")
+        self.action_timezone_status.triggered.connect(self.show_timezone_status)
+        self.menu.addAction(self.action_timezone_status)
+
+        self.action_region_from_ip = QAction("根据公网 IP 调整 Windows 地区和区域格式")
         self.action_region_from_ip.triggered.connect(self.set_region_from_ip)
         self.menu.addAction(self.action_region_from_ip)
 
         self.menu.addSeparator()
 
-        self.action_settings = QAction("Settings")
+        self.action_settings = QAction("设置…")
         self.action_settings.triggered.connect(self.open_settings)
         self.menu.addAction(self.action_settings)
 
         # New GitHub link (ultra aesthetic)
         self.menu.addSeparator()
-        self.action_github = QAction(github_icon(), "Open GitHub (mixtrus)")
+        self.action_github = QAction(github_icon(), "访问作者的 GitHub 主页")
         self.action_github.triggered.connect(lambda: webbrowser.open("https://github.com/mixtrus"))
         self.menu.addAction(self.action_github)
 
         # Disabled invitation action (ultra aesthetic star)
-        self.action_invite = QAction(star_icon(), "Please star, support, and report bugs on GitHub ♥")
+        self.action_invite = QAction(star_icon(), "欢迎在 GitHub 点赞支持或反馈问题")
         self.action_invite.setEnabled(False)
         self.menu.addAction(self.action_invite)
 
         self.menu.addSeparator()
 
-        self.action_exit = QAction("Exit")
+        self.action_exit = QAction("退出")
         self.action_exit.triggered.connect(self.exit_app)
         self.menu.addAction(self.action_exit)
 
@@ -586,6 +634,7 @@ class TrayApp:
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self._update_tray_icon)
         self.ui_timer.start(1000)
+        self.timezone_follower.configure()
 
     def _notify(self, text: str, icon: QSystemTrayIcon.MessageIcon = QSystemTrayIcon.NoIcon, timeout_ms: int = 4000):
         """
@@ -605,14 +654,14 @@ class TrayApp:
             dlg = WelcomeDialog(self.cfg)
             dlg.exec()
         except Exception:
-            self._notify("TimeGuardian started. Right-click the tray icon for Settings.")
+            self._notify("TimeGuardian 已启动。右键点击托盘图标即可打开设置。")
 
     def _on_status_changed(self):
         QTimer.singleShot(0, self._update_tray_icon)
 
     def _on_best_server_changed(self, server: str, rtt_ms: float):
         # Announce the new best server selection (auto mode only)
-        self._notify(f"Auto-selected best NTP server: {server} ({rtt_ms:.0f} ms)")
+        self._notify(f"已自动选择校时服务器：{server}（延迟 {rtt_ms:.0f} 毫秒）")
 
     def _is_connected(self) -> bool:
         ttl = self.cfg.settings.connected_status_ttl_sec
@@ -624,20 +673,19 @@ class TrayApp:
         # Icon priority: Default app icon (logo or idle) when no result yet -> Connected -> Disconnected
         if self.state.last_result is None:
             self.tray.setIcon(default_app_icon())
-            tip = f"{APP_NAME} - Starting..."
+            tip = f"{APP_NAME} · 等待校时"
         else:
             if self._is_connected():
                 self.tray.setIcon(connected_icon())
             else:
                 self.tray.setIcon(disconnected_icon())
             if self.state.last_result and self.state.last_result.success:
-                tip = f"{APP_NAME} - Server: {self.state.last_result.server} | RTT: {self.state.last_result.rtt_ms:.0f} ms | Drift: {self.state.last_result.offset_ms:.0f} ms"
+                tip = f"{APP_NAME}\n服务器：{self.state.last_result.server}\n延迟：{self.state.last_result.rtt_ms:.0f} 毫秒 · 时差：{self.state.last_result.offset_ms:.0f} 毫秒"
             elif self.state.last_result and not self.state.last_result.success:
-                method_hint = f" ({self.state.last_result.error})" if self.state.last_result.error else ""
-                tip = f"{APP_NAME} - Last error: {self.state.last_result.error or 'Unknown'}{method_hint}"
+                tip = f"{APP_NAME} · 最近一次校时失败\n{self.state.last_result.error or '原因未知'}"
             else:
-                tip = f"{APP_NAME} - Idle"
-        self.tray.setToolTip(tip)
+                tip = f"{APP_NAME} · 等待校时"
+        self.tray.setToolTip(tip + "\n时区跟随：" + self.timezone_follower.status.splitlines()[0])
 
     @Slot()
     def _on_tray_activated(self, reason):
@@ -656,7 +704,7 @@ class TrayApp:
         exe = sys.executable
         ok, msg = time_utils.register_startup(APP_NAME, exe, enable)
         if not ok:
-            self._notify(f"Startup setting failed: {msg}", QSystemTrayIcon.Information, 5000)
+            self._notify(f"自启动设置未生效：{msg}", QSystemTrayIcon.Information, 5000)
 
     def toggle_startup(self, checked: bool):
         self.cfg.settings.launch_at_startup = checked
@@ -669,7 +717,7 @@ class TrayApp:
             try:
                 res = self.sync_manager._choose_server(self.cfg.settings.ntp_timeout_ms)
                 if not res:
-                    self.state.last_result = NtpResult(server="(none)", rtt_ms=0, offset_ms=0, success=False, error="All servers failed")
+                    self.state.last_result = NtpResult(server="（无）", rtt_ms=0, offset_ms=0, success=False, error="所有校时服务器均未响应")
                     self._on_status_changed()
                     return
                 self.state.last_result = res
@@ -681,28 +729,35 @@ class TrayApp:
                 self._on_status_changed()
                 self._notify(msg)
             except Exception as e:
-                self.state.last_result = NtpResult(server="(error)", rtt_ms=0, offset_ms=0, success=False, error=str(e))
+                self.state.last_result = NtpResult(server="（异常）", rtt_ms=0, offset_ms=0, success=False, error=f"校时过程中发生异常：{e}")
                 self._on_status_changed()
-                self._notify(f"Sync failed: {e}", QSystemTrayIcon.Critical, 5000)
+                self._notify(f"校时失败：{e}", QSystemTrayIcon.Critical, 5000)
         threading.Thread(target=work, daemon=True).start()
 
     def open_settings(self):
-        dlg = SettingsDialog(self.cfg, parent=None)
+        dlg = SettingsDialog(self.cfg, parent=None, follow_status=self.timezone_follower.status)
+        self.timezone_follower.status_changed.connect(dlg.follow_status.setText)
         if dlg.exec() == QDialog.Accepted:
             self._apply_startup_flag(self.cfg.settings.launch_at_startup)
+            self.action_auto_timezone.setChecked(self.cfg.settings.auto_timezone_enabled)
+            self.timezone_follower.configure()
             if self.cfg.settings.auto_sync_enabled and not self.state.running:
                 self.sync_manager.start()
 
     def set_timezone_dialog(self):
         choices = time_utils.list_timezone_choices_labels()
         if not choices:
-            QMessageBox.warning(None, APP_NAME, "Failed to enumerate Windows time zones.", QMessageBox.Ok)
+            QMessageBox.warning(None, APP_NAME, "无法读取 Windows 时区列表。", QMessageBox.Ok)
             return
         d = QDialog()
-        d.setWindowTitle("Select timezone")
+        d.setWindowTitle("选择时区")
+        d.setMinimumWidth(540)
         v = QVBoxLayout(d)
-        lbl = QLabel("Choose timezone (UTC offset with city/region):")
+        lbl = QLabel("选择时区（按 UTC 偏移和城市／地区排列）：")
         v.addWidget(lbl)
+        if self.cfg.settings.auto_timezone_enabled:
+            hint = QLabel("手动选择并确认后，将暂停自动跟随。")
+            v.addWidget(hint)
         cb = QComboBox()
         for label, key in choices:
             cb.addItem(label, userData=key)
@@ -717,47 +772,38 @@ class TrayApp:
         btns.rejected.connect(d.reject)
         if d.exec() == QDialog.Accepted:
             key = cb.currentData()
+            self.cfg.settings.auto_timezone_enabled = False
+            self.cfg.save()
+            self.action_auto_timezone.setChecked(False)
+            self.timezone_follower.configure()
             ok, msg = time_utils.set_windows_timezone(key)
             self._notify(msg, QSystemTrayIcon.Information if ok else QSystemTrayIcon.Critical, 4000)
 
     def set_timezone_from_ip(self):
         if not self.cfg.settings.allow_timezone_from_ip:
-            ret = QMessageBox.question(None, APP_NAME, "Timezone-from-IP is disabled in Settings. Enable now?", QMessageBox.Yes | QMessageBox.No)
+            ret = QMessageBox.question(None, APP_NAME, "尚未启用“根据公网 IP 设置时区”。是否启用并立即查询？", QMessageBox.Yes | QMessageBox.No)
             if ret != QMessageBox.Yes:
                 return
             self.cfg.settings.allow_timezone_from_ip = True
             self.cfg.save()
-        def work():
-            try:
-                iana, off = time_utils.get_timezone_from_ip_modern()
-                applied = False
-                msg = ""
-                if iana:
-                    win_key = None
-                    for k, v in time_utils.WIN_TO_IANA.items():
-                        if v.lower() == (iana or "").lower():
-                            win_key = k
-                            break
-                    if win_key:
-                        ok, msg = time_utils.set_windows_timezone(win_key)
-                        applied = ok
-                    else:
-                        msg = f"No Windows zone mapping for {iana}; attempting by offset."
-                if not applied and off is not None:
-                    ok2, msg2 = time_utils.set_timezone_by_utc_label(time_utils._format_utc_offset(off, with_space=False))
-                    msg = msg or msg2
-                    applied = ok2
-                if not applied:
-                    self._notify(f"Failed to set timezone from IP. {msg}", QSystemTrayIcon.Critical, 5000)
-                else:
-                    self._notify(f"Timezone set. {msg}", QSystemTrayIcon.Information, 5000)
-            except Exception as e:
-                self._notify(f"Timezone-from-IP failed: {e}", QSystemTrayIcon.Critical, 5000)
-        threading.Thread(target=work, daemon=True).start()
+        self.timezone_follower.request_check(manual=True)
+
+    def toggle_auto_timezone(self, enabled):
+        self.cfg.settings.auto_timezone_enabled = bool(enabled)
+        self.cfg.save()
+        self.timezone_follower.configure()
+
+    def show_timezone_status(self):
+        follower = self.timezone_follower
+        details = "\n".join(follower.last_result.details) if follower.last_result else ""
+        message = f"{follower.status}\n\n{details}\n\n运行记录：{follower.log_dir / 'timezone-follow.log'}"
+        box = QMessageBox(QMessageBox.Information, "时区跟随状态", message, QMessageBox.Ok)
+        box.setTextFormat(Qt.PlainText)
+        box.exec()
 
     def set_region_from_ip(self):
         if not self.cfg.settings.allow_region_from_ip:
-            ret = QMessageBox.question(None, APP_NAME, "Region-from-IP is disabled in Settings. Enable now?", QMessageBox.Yes | QMessageBox.No)
+            ret = QMessageBox.question(None, APP_NAME, "尚未启用“根据公网 IP 调整 Windows 地区和区域格式”。\n此操作可能影响日期、数字等显示格式。是否启用并继续？", QMessageBox.Yes | QMessageBox.No)
             if ret != QMessageBox.Yes:
                 return
             self.cfg.settings.allow_region_from_ip = True
@@ -769,7 +815,7 @@ class TrayApp:
             except Exception:
                 cc = None
             if not cc:
-                self._notify("Failed to detect country from IP.", QSystemTrayIcon.Critical, 4000)
+                self._notify("无法根据公网 IP 确定国家或地区，请检查网络连接后重试。", QSystemTrayIcon.Critical, 4000)
                 return
             ok, msg = time_utils.set_region_from_country_code(cc)
             self._notify(msg, QSystemTrayIcon.Information if ok else QSystemTrayIcon.Critical, 6000)
@@ -778,6 +824,7 @@ class TrayApp:
     def exit_app(self):
         try:
             self.sync_manager.stop()
+            self.timezone_follower.stop()
         except Exception:
             pass
         self.tray.hide()
@@ -791,7 +838,7 @@ def main():
         app = TrayApp()
         app.run()
     except Exception as e:
-        QMessageBox.critical(None, APP_NAME, f"Fatal error: {e}\n\n{traceback.format_exc()}")
+        QMessageBox.critical(None, APP_NAME, f"程序无法继续运行：{e}\n\n详细错误信息：\n{traceback.format_exc()}")
         sys.exit(1)
 
 if __name__ == "__main__":
