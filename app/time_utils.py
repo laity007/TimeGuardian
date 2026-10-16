@@ -24,7 +24,17 @@ class SYSTEMTIME(ctypes.Structure):
 def is_windows() -> bool:
     return os.name == "nt"
 
-def set_system_time_utc_via_helper(target_epoch_ms: int) -> Tuple[bool, str]:
+def set_system_time_utc_via_helper(target_epoch_ms: int, allow_elevation: bool = False) -> Tuple[bool, str]:
+    from elevated_time_setter import set_system_time_utc
+    try:
+        if set_system_time_utc(target_epoch_ms):
+            return True, "系统时间已校准。"
+    except (OSError, ValueError, OverflowError) as error:
+        return False, f"校时失败：{error}"
+    if not allow_elevation:
+        return False, "自动校时未执行：当前权限不足。可使用 Windows 自动校时，或主动点击“立即校时”授权；后台不会弹出权限请求。"
+    if getattr(sys, "frozen", False):
+        return False, "当前打包版本无法单独启动校时辅助程序，请使用 Windows 设置中的“立即同步”。"
     helper = os.path.join(os.path.dirname(sys.argv[0]), "elevated_time_setter.py")
     if not os.path.isfile(helper):
         candidate = os.path.join(os.path.dirname(__file__), "..", "elevated_time_setter.py")
@@ -33,16 +43,28 @@ def set_system_time_utc_via_helper(target_epoch_ms: int) -> Tuple[bool, str]:
             helper = candidate
     if not os.path.isfile(helper):
         return False, "未找到校时所需的管理员权限辅助程序。"
-    python_exe = sys.executable
+    python_exe = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    arguments = subprocess.list2cmdline([helper, "--set-utc-epoch-ms", str(target_epoch_ms)])
+    def ps_quote(value):
+        return "'" + value.replace("'", "''") + "'"
     cmd = [
         "powershell",
         "-ExecutionPolicy", "Bypass",
         "-Command",
-        f"Start-Process -FilePath '{python_exe}' -ArgumentList @('{helper}', '--set-utc-epoch-ms', '{target_epoch_ms}') -Verb RunAs -WindowStyle Hidden"
+        "$ErrorActionPreference = 'Stop'; try { "
+        f"$timeGuardianHelper = Start-Process -FilePath {ps_quote(python_exe)} "
+        f"-ArgumentList {ps_quote(arguments)} -Verb RunAs -WindowStyle Hidden -PassThru -Wait; "
+        "exit $timeGuardianHelper.ExitCode } catch { "
+        "if ($_.Exception.NativeErrorCode -eq 1223) { exit 1223 }; exit 1 }"
     ]
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        return True, "已请求管理员权限执行校时，尚需确认是否校准成功。"
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode == 0:
+            return True, "系统时间已校准。"
+        if result.returncode == 1223:
+            return False, "已取消校时授权，后台不会重试提权。"
+        return False, "未能完成授权校时，请确认是否取消了权限请求，或使用 Windows 设置中的“立即同步”。"
     except subprocess.TimeoutExpired:
         return False, "请求管理员权限超时，请重试。"
     except Exception as e:

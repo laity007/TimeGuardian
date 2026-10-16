@@ -70,10 +70,10 @@ def query_ntp_once(server: str, timeout_ms: int = 800) -> NtpResult:
         return NtpResult(server, rtt_ms=0, offset_ms=0, success=False, error="服务器返回的 NTP 数据不完整")
 
     unpacked = struct.unpack("!B B b b 11I", data)
-    recv_sec = unpacked[9]
-    recv_frac = unpacked[10]
-    tx_sec = unpacked[11]
-    tx_frac = unpacked[12]
+    recv_sec = unpacked[11]
+    recv_frac = unpacked[12]
+    tx_sec = unpacked[13]
+    tx_frac = unpacked[14]
 
     # Server timestamps
     t2_ntp = _parts_to_timestamp(recv_sec, recv_frac)

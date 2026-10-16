@@ -29,8 +29,8 @@ def enable_set_time_privilege() -> bool:
     """
     Enable SeSystemtimePrivilege for this process token. Requires elevation.
     """
-    advapi32 = ctypes.windll.advapi32
-    kernel32 = ctypes.windll.kernel32
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
     SE_PRIVILEGE_ENABLED = 0x00000002
     TOKEN_ADJUST_PRIVILEGES = 0x0020
@@ -45,32 +45,48 @@ def enable_set_time_privilege() -> bool:
     class TOKEN_PRIVILEGES(ctypes.Structure):
         _fields_ = [("PrivilegeCount", ctypes.c_uint32), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
 
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+    advapi32.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+                                             wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ctypes.byref(token)):
         return False
 
-    luid = LUID()
-    if not advapi32.LookupPrivilegeValueW(None, "SeSystemtimePrivilege", ctypes.byref(luid)):
-        return False
-
-    tp = TOKEN_PRIVILEGES()
-    tp.PrivilegeCount = 1
-    tp.Privileges[0].Luid = luid
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
-
-    if not advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None):
-        return False
-
-    return True
+    try:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, "SeSystemtimePrivilege", ctypes.byref(luid)):
+            return False
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0].Luid = luid
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+        ctypes.set_last_error(0)
+        ok = advapi32.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+        # The API can return success together with ERROR_NOT_ALL_ASSIGNED.
+        return bool(ok) and ctypes.get_last_error() == 0
+    finally:
+        kernel32.CloseHandle(token)
 
 def set_system_time_utc(epoch_ms: int) -> bool:
     """
     Sets the system time to the specified UTC epoch milliseconds.
     """
-    dt = datetime.datetime.utcfromtimestamp(epoch_ms / 1000.0).replace(tzinfo=None)
+    if not enable_set_time_privilege():
+        return False
+    dt = datetime.datetime.fromtimestamp(epoch_ms / 1000.0, datetime.timezone.utc).replace(tzinfo=None)
     st = dt_to_systemtime(dt)
-    enable_set_time_privilege()
-    ok = ctypes.windll.kernel32.SetSystemTime(ctypes.byref(st))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetSystemTime.argtypes = [ctypes.POINTER(SYSTEMTIME)]
+    kernel32.SetSystemTime.restype = wintypes.BOOL
+    ok = kernel32.SetSystemTime(ctypes.byref(st))
     return ok != 0
 
 def main():

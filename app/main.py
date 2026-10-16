@@ -4,6 +4,7 @@ import time
 import traceback
 import webbrowser
 import ctypes
+import logging
 from typing import Optional, Tuple, List
 
 from PySide6.QtCore import QTimer, Qt, Slot, Signal
@@ -81,14 +82,14 @@ class NtpSyncManager:
                     pass
         return best
 
-    def _verify_and_apply_time(self, selected: NtpResult) -> Tuple[bool, str]:
+    def _verify_and_apply_time(self, selected: NtpResult, allow_elevation: bool = False) -> Tuple[bool, str]:
         threshold_ms = self.cfg.settings.drift_threshold_ms
         drift = selected.offset_ms
         if abs(drift) < threshold_ms:
             return False, f"当前时差为 {drift:.1f} 毫秒，未达到校时阈值（{threshold_ms} 毫秒），无需调整。"
         now_epoch = time.time()
         target_epoch_ms = int((now_epoch + (drift / 1000.0)) * 1000)
-        ok, msg = time_utils.set_system_time_utc_via_helper(target_epoch_ms)
+        ok, msg = time_utils.set_system_time_utc_via_helper(target_epoch_ms, allow_elevation=allow_elevation)
         return ok, f"本次时差为 {drift:.1f} 毫秒。{msg}"
 
     def _run_loop(self):
@@ -113,15 +114,23 @@ class NtpSyncManager:
                         self.on_status_changed()
 
                     changed, message = self._verify_and_apply_time(selected)
+                    logging.getLogger("TimeGuardian.timezone").info("后台 NTP 校时：%s", message)
                     if changed:
                         time.sleep(3.0)
                         recheck = query_ntp(selected.server, timeout_ms=self.cfg.settings.ntp_timeout_ms, samples=2)
                         if recheck.success and abs(recheck.offset_ms) < self.cfg.settings.drift_threshold_ms:
                             self.state.last_success_time = time.time()
                         else:
-                            self.state.last_success_time = time.time()
+                            self.state.last_success_time = 0.0
+                            self.state.last_result = NtpResult(selected.server, selected.rtt_ms, selected.offset_ms,
+                                                               False, "校时后的复查未通过，请稍后重试。")
                     else:
-                        self.state.last_success_time = time.time()
+                        if abs(selected.offset_ms) < self.cfg.settings.drift_threshold_ms:
+                            self.state.last_success_time = time.time()
+                        else:
+                            self.state.last_success_time = 0.0
+                            self.state.last_result = NtpResult(selected.server, selected.rtt_ms, selected.offset_ms,
+                                                               False, message)
 
                 except Exception as e:
                     self.state.last_result = NtpResult(server="（异常）", rtt_ms=0, offset_ms=0, success=False, error=f"校时过程中发生异常：{e}")
@@ -229,7 +238,7 @@ class SettingsDialog(QDialog):
 
         # Auto sync
         self.chk_auto = QCheckBox("定期自动校时")
-        self.chk_auto.setToolTip("定期检查系统时间，仅在时差达到阈值时校正；此选项不会自动切换时区。")
+        self.chk_auto.setToolTip("定期检查系统时间；权限不足时跳过校正，后台不会弹出管理员权限请求。可主动点击“立即校时”授权。此选项不会自动切换时区。")
         self.chk_auto.setChecked(cfg.settings.auto_sync_enabled)
         layout.addWidget(self.chk_auto)
 
@@ -665,7 +674,7 @@ class TrayApp:
 
     def _is_connected(self) -> bool:
         ttl = self.cfg.settings.connected_status_ttl_sec
-        if self.state.last_success_time <= 0:
+        if self.state.last_success_time <= 0 or not self.state.last_result or not self.state.last_result.success:
             return False
         return (time.time() - self.state.last_success_time) < ttl
 
@@ -722,10 +731,14 @@ class TrayApp:
                     return
                 self.state.last_result = res
                 self._on_status_changed()
-                changed, msg = self.sync_manager._verify_and_apply_time(res)
+                changed, msg = self.sync_manager._verify_and_apply_time(res, allow_elevation=True)
                 if changed:
                     time.sleep(2.0)
-                self.state.last_success_time = time.time()
+                if changed or abs(res.offset_ms) < self.cfg.settings.drift_threshold_ms:
+                    self.state.last_success_time = time.time()
+                else:
+                    self.state.last_success_time = 0.0
+                    self.state.last_result = NtpResult(res.server, res.rtt_ms, res.offset_ms, False, msg)
                 self._on_status_changed()
                 self._notify(msg)
             except Exception as e:
