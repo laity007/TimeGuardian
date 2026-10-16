@@ -5,6 +5,7 @@ import ctypes
 import datetime
 from ctypes import wintypes
 import sys
+import time
 
 # Windows SYSTEMTIME structure
 class SYSTEMTIME(ctypes.Structure):
@@ -92,9 +93,13 @@ def set_system_time_utc(epoch_ms: int) -> bool:
 def main():
     parser = argparse.ArgumentParser(description="以管理员权限校准 Windows 系统时间。")
     parser.add_argument("--set-utc-epoch-ms", type=int, required=True, help="目标 UTC 时间，以 Unix 时间戳的毫秒数表示。")
+    parser.add_argument("--measured-at-monotonic", type=float, help="测量时的单调时钟读数，用于补偿等待授权的耗时。")
     args = parser.parse_args()
 
-    if set_system_time_utc(args.set_utc_epoch_ms):
+    target = args.set_utc_epoch_ms
+    if args.measured_at_monotonic is not None:
+        target += int((time.monotonic() - args.measured_at_monotonic) * 1000)
+    if set_system_time_utc(target):
         sys.exit(0)
     else:
         sys.exit(2)

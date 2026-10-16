@@ -14,7 +14,8 @@ TimeGuardian 是运行于 Windows 通知区域的校时与时区工具。
 ## 菜单和设置
 
 - **立即校时**：向 NTP 服务器查询时间，时差达到阈值时尝试校正。当前进程权限不足时，此手动操作允许请求管理员权限；取消后不会转入后台重试。
-- **定期自动校时**：按照设置中的检查间隔检查系统时间；后台不请求管理员权限。权限不足时跳过校正并显示状态，可使用 Windows 自动校时，或主动点击“立即校时”授权。此开关与自动切换时区独立。
+- **定期检测系统时间**：按照设置中的检查间隔测量时差，后台只读检测，不请求管理员权限；Windows Time 服务负责长期校准。此开关与自动切换时区独立，关闭它不会停止系统服务。
+- **启用 Windows 自动校时…**：首次授权一次，将系统自带的 Windows Time 服务设为自动启动、启用 NTP 客户端并请求同步。保留服务器地址；非域计算机 NTP 来源的默认 `0x9` 改为 `0x8`，使用 Windows 自适应轮询，避免固定长间隔的同步问题；原先为 NoSync 时恢复手动来源。域时间来源保持原配置。配置前备份服务状态。配置成功仅表示服务已启用并完成同步请求，实际时钟状态仍需检测确认。
 - **测试延迟**：比较服务器的往返延迟，显示多次采样的中位数。NTP 测试失败时会尝试 ICMP；ICMP 响应只能说明网络可达，不能证明 NTP 服务可用。
 - **首选服务器**：关闭自动选择后优先使用的服务器。可在列表中选择一项，再点击“将所选设为首选”。
 - **手动选择时区**：从 Windows 时区列表中选择；列表显示系统提供的中文地区名称。
@@ -23,7 +24,9 @@ TimeGuardian 是运行于 Windows 通知区域的校时与时区工具。
 - **查看时区跟随状态**：查看当前状态、最近一次可信查询的来源和运行记录位置。
 - **根据公网 IP 调整 Windows 地区和区域格式**：尝试更改国家或地区，以及日期、数字等区域格式；可能需要管理员权限或重启。
 
-**“定期自动校时”和“自动跟随代理出口时区”是两个独立开关。** 自动跟随只更改时区，不调整系统 UTC 时钟，也不更改 Windows 地区或区域格式。
+**“定期检测系统时间”和“自动跟随代理出口时区”是两个独立开关。** 自动跟随只更改时区，不调整系统 UTC 时钟，也不更改 Windows 地区或区域格式。
+
+时间检测会显示“本机快/慢约多少秒”：NTP 负偏差表示本机快，正偏差表示本机慢。服务未启用、系统正在校准、取消手动授权均显示黄色中性状态，不再误报为校时失败；实际检测回到阈值内才显示正常。若每次检测都看到相近偏差，可能是同一段偏差一直没有校正，不代表每轮又多偏了一次。手动校时会补偿等待授权的耗时，避免将等待前的旧时间写回系统。
 
 ## 自动跟随的判断规则
 
@@ -54,11 +57,14 @@ TUN 分流可能使不同服务使用不同出口；本功能跟随 Cloudflare t
 - 启动错误日志：`%LOCALAPPDATA%\TimeGuardian\startup-error.log`。
 - 时区跟随日志：`%LOCALAPPDATA%\TimeGuardian\timezone-follow.log`，新日志使用 UTC 时间和 `Z` 后缀，轮转保留，避免无限增长。
 - 最近检测状态：`%LOCALAPPDATA%\TimeGuardian\timezone-follow-status.json`。
+- Windows 校时服务配置前备份：`%LOCALAPPDATA%\TimeGuardian\windows-time-before.json`；每次配置结果写入同目录的 `windows-time-setup-*.json`。
 - 依赖：按仓库根目录 `requirements.txt` 安装，推荐使用专属虚拟环境。
 - 上游项目：<https://github.com/mixtrus/TimeGuardian>，许可证为 MIT。
 
 ## 验证
 
-在仓库根目录运行专属环境的 `python.exe -m unittest discover -s tests -v`。测试模拟网络和系统时区写入，覆盖映射、夏令时、来源冲突、出口变化、缓存、自动确认以及关闭后的在途结果；不会改动真实系统时区。Windows 时区映射测试需要在 Windows 上运行。
+在仓库根目录运行专属环境的 `python.exe -m unittest discover -s tests -v`。42 项测试模拟网络和系统写入，覆盖时区跟随、后台禁止提权、服务配置、待校准状态、授权等待补偿和校时后复查，不会改动真实系统时间、时区或服务。Windows 时区映射和权限测试需要在 Windows 上运行。
 
 映射 API 文档：<https://doc.qt.io/qtforpython-6/PySide6/QtCore/QTimeZone.html>。
+
+Windows 轮询配置依据：<https://learn.microsoft.com/en-us/troubleshoot/windows-server/identity/w32time-sync-specialpollinterval-ignored>。

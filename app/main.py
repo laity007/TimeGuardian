@@ -17,10 +17,11 @@ from PySide6.QtWidgets import (
 
 from app.config import Config, Settings, APP_NAME
 from app.ntp_client import query_ntp, NtpResult, ping_servers
-from app.icons import connected_icon, disconnected_icon, idle_icon, default_app_icon, github_icon, star_icon
+from app.icons import connected_icon, disconnected_icon, idle_icon, pending_icon, default_app_icon, github_icon, star_icon
 from app import time_utils
 from app.localization import configure_chinese
 from app.timezone_follow import TimezoneFollower
+from app.windows_time import service_running, ServiceSetupController
 import requests
 
 # Thread-safe flags and shared state
@@ -31,6 +32,8 @@ class SyncState:
         self.running = False
         self.stop_requested = False
         self.last_best_server: str = ""
+        self.correction_status = "idle"
+        self.last_message = ""
 
 class NtpSyncManager:
     """
@@ -82,15 +85,30 @@ class NtpSyncManager:
                     pass
         return best
 
-    def _verify_and_apply_time(self, selected: NtpResult, allow_elevation: bool = False) -> Tuple[bool, str]:
+    def _verify_and_apply_time(self, selected: NtpResult, allow_elevation: bool = False) -> time_utils.ClockCorrectionResult:
         threshold_ms = self.cfg.settings.drift_threshold_ms
         drift = selected.offset_ms
         if abs(drift) < threshold_ms:
-            return False, f"当前时差为 {drift:.1f} 毫秒，未达到校时阈值（{threshold_ms} 毫秒），无需调整。"
+            return time_utils.ClockCorrectionResult(False, f"{time_utils.clock_deviation_text(drift)}，处于检测阈值内。", "ok")
+        if not allow_elevation:
+            if service_running():
+                return time_utils.ClockCorrectionResult(False, "Windows 校时服务已运行，偏差交由系统校准。", "system_managed")
+            return time_utils.ClockCorrectionResult(False, "Windows 校时服务尚未启用；可从托盘菜单启用，首次需要一次授权。", "service_stopped")
         now_epoch = time.time()
         target_epoch_ms = int((now_epoch + (drift / 1000.0)) * 1000)
-        ok, msg = time_utils.set_system_time_utc_via_helper(target_epoch_ms, allow_elevation=allow_elevation)
-        return ok, f"本次时差为 {drift:.1f} 毫秒。{msg}"
+        result = time_utils.set_system_time_utc_via_helper(target_epoch_ms, allow_elevation=allow_elevation)
+        return result._replace(message=f"{time_utils.clock_deviation_text(drift)}。{result.message}")
+
+    def _record_correction(self, selected, result):
+        self.state.correction_status = result.status
+        self.state.last_message = result.message
+        self.state.last_result = selected
+        if result.applied or result.status == "ok":
+            self.state.last_success_time = time.time()
+        else:
+            self.state.last_success_time = 0.0
+            if result.status == "error":
+                self.state.last_result = NtpResult(selected.server, selected.rtt_ms, selected.offset_ms, False, result.message)
 
     def _run_loop(self):
         self.state.running = True
@@ -113,24 +131,9 @@ class NtpSyncManager:
                     if self.on_status_changed:
                         self.on_status_changed()
 
-                    changed, message = self._verify_and_apply_time(selected)
-                    logging.getLogger("TimeGuardian.timezone").info("后台 NTP 校时：%s", message)
-                    if changed:
-                        time.sleep(3.0)
-                        recheck = query_ntp(selected.server, timeout_ms=self.cfg.settings.ntp_timeout_ms, samples=2)
-                        if recheck.success and abs(recheck.offset_ms) < self.cfg.settings.drift_threshold_ms:
-                            self.state.last_success_time = time.time()
-                        else:
-                            self.state.last_success_time = 0.0
-                            self.state.last_result = NtpResult(selected.server, selected.rtt_ms, selected.offset_ms,
-                                                               False, "校时后的复查未通过，请稍后重试。")
-                    else:
-                        if abs(selected.offset_ms) < self.cfg.settings.drift_threshold_ms:
-                            self.state.last_success_time = time.time()
-                        else:
-                            self.state.last_success_time = 0.0
-                            self.state.last_result = NtpResult(selected.server, selected.rtt_ms, selected.offset_ms,
-                                                               False, message)
+                    result = self._verify_and_apply_time(selected)
+                    logging.getLogger("TimeGuardian.timezone").info("时间检测：%s；%s", time_utils.clock_deviation_text(selected.offset_ms), result.message)
+                    self._record_correction(selected, result)
 
                 except Exception as e:
                     self.state.last_result = NtpResult(server="（异常）", rtt_ms=0, offset_ms=0, success=False, error=f"校时过程中发生异常：{e}")
@@ -237,14 +240,14 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
 
         # Auto sync
-        self.chk_auto = QCheckBox("定期自动校时")
-        self.chk_auto.setToolTip("定期检查系统时间；权限不足时跳过校正，后台不会弹出管理员权限请求。可主动点击“立即校时”授权。此选项不会自动切换时区。")
+        self.chk_auto = QCheckBox("定期检测系统时间（校准由 Windows 服务负责）")
+        self.chk_auto.setToolTip("此开关控制时差检测；Windows 服务独立负责长期校准。可从托盘菜单首次授权启用服务，程序后台不请求权限。")
         self.chk_auto.setChecked(cfg.settings.auto_sync_enabled)
         layout.addWidget(self.chk_auto)
 
         # Interval
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("校时检查间隔："))
+        row1.addWidget(QLabel("时间检测间隔："))
         self.spin_interval = QSpinBox()
         self.spin_interval.setRange(30, 86400)
         self.spin_interval.setValue(cfg.settings.check_interval_sec)
@@ -254,7 +257,7 @@ class SettingsDialog(QDialog):
 
         # Threshold
         row2 = QHBoxLayout()
-        row2.addWidget(QLabel("校时阈值："))
+        row2.addWidget(QLabel("时差阈值："))
         self.spin_threshold = QSpinBox()
         self.spin_threshold.setRange(10, 60000)
         self.spin_threshold.setValue(cfg.settings.drift_threshold_ms)
@@ -529,6 +532,8 @@ class TrayApp:
         self.cfg = Config()
         self.state = SyncState()
         self.timezone_follower = TimezoneFollower(self.cfg)
+        self.service_setup = ServiceSetupController()
+        self.service_setup.finished.connect(self._on_service_setup_finished)
         self.timezone_follower.notice.connect(
             lambda text, error: self._notify(text, QSystemTrayIcon.Warning if error else QSystemTrayIcon.Information, 6000)
         )
@@ -565,11 +570,14 @@ class TrayApp:
         self.action_sync_now.triggered.connect(self.sync_now)
         self.menu.addAction(self.action_sync_now)
 
-        self.action_auto = QAction("定期自动校时")
+        self.action_auto = QAction("定期检测系统时间")
         self.action_auto.setCheckable(True)
         self.action_auto.setChecked(self.cfg.settings.auto_sync_enabled)
         self.action_auto.triggered.connect(self.toggle_auto_sync)
         self.menu.addAction(self.action_auto)
+        self.action_windows_time = QAction("启用 Windows 自动校时…")
+        self.action_windows_time.triggered.connect(self.service_setup.start)
+        self.menu.addAction(self.action_windows_time)
 
         self.menu.addSeparator()
 
@@ -684,12 +692,19 @@ class TrayApp:
             self.tray.setIcon(default_app_icon())
             tip = f"{APP_NAME} · 等待校时"
         else:
-            if self._is_connected():
+            pending_titles = {"system_managed": "等待 Windows 校准时间", "service_stopped": "Windows 自动校时尚未启用",
+                              "permission_required": "等待校时授权", "cancelled": "已取消本次校时"}
+            pending = self.state.last_result.success and self.state.correction_status in pending_titles
+            if pending:
+                self.tray.setIcon(pending_icon())
+            elif self._is_connected():
                 self.tray.setIcon(connected_icon())
             else:
                 self.tray.setIcon(disconnected_icon())
-            if self.state.last_result and self.state.last_result.success:
-                tip = f"{APP_NAME}\n服务器：{self.state.last_result.server}\n延迟：{self.state.last_result.rtt_ms:.0f} 毫秒 · 时差：{self.state.last_result.offset_ms:.0f} 毫秒"
+            if pending:
+                tip = f"{APP_NAME} · {pending_titles[self.state.correction_status]}\n测量结果：{time_utils.clock_deviation_text(self.state.last_result.offset_ms)}\n{self.state.last_message}"
+            elif self.state.last_result and self.state.last_result.success:
+                tip = f"{APP_NAME}\n服务器：{self.state.last_result.server}\n延迟：{self.state.last_result.rtt_ms:.0f} 毫秒 · {time_utils.clock_deviation_text(self.state.last_result.offset_ms)}"
             elif self.state.last_result and not self.state.last_result.success:
                 tip = f"{APP_NAME} · 最近一次校时失败\n{self.state.last_result.error or '原因未知'}"
             else:
@@ -731,21 +746,32 @@ class TrayApp:
                     return
                 self.state.last_result = res
                 self._on_status_changed()
-                changed, msg = self.sync_manager._verify_and_apply_time(res, allow_elevation=True)
-                if changed:
+                result = self.sync_manager._verify_and_apply_time(res, allow_elevation=True)
+                if result.applied:
                     time.sleep(2.0)
-                if changed or abs(res.offset_ms) < self.cfg.settings.drift_threshold_ms:
-                    self.state.last_success_time = time.time()
-                else:
-                    self.state.last_success_time = 0.0
-                    self.state.last_result = NtpResult(res.server, res.rtt_ms, res.offset_ms, False, msg)
+                    recheck = query_ntp(res.server, timeout_ms=self.cfg.settings.ntp_timeout_ms, samples=2)
+                    if recheck.success and abs(recheck.offset_ms) < self.cfg.settings.drift_threshold_ms:
+                        res = recheck
+                        result = result._replace(message=f"系统时间已校准，复查结果：{time_utils.clock_deviation_text(recheck.offset_ms)}。")
+                    else:
+                        result = time_utils.ClockCorrectionResult(False, "校时后的复查未通过，请稍后重试。", "error")
+                self.sync_manager._record_correction(res, result)
                 self._on_status_changed()
-                self._notify(msg)
+                self._notify(result.message)
             except Exception as e:
                 self.state.last_result = NtpResult(server="（异常）", rtt_ms=0, offset_ms=0, success=False, error=f"校时过程中发生异常：{e}")
                 self._on_status_changed()
                 self._notify(f"校时失败：{e}", QSystemTrayIcon.Critical, 5000)
         threading.Thread(target=work, daemon=True).start()
+
+    def _on_service_setup_finished(self, ok, message):
+        self._notify(message, QSystemTrayIcon.Information if ok else QSystemTrayIcon.Warning, 8000)
+        if ok:
+            if (self.state.last_result and self.state.last_result.success
+                    and abs(self.state.last_result.offset_ms) >= self.cfg.settings.drift_threshold_ms):
+                self.state.correction_status = "system_managed"
+            self.state.last_message = message
+            self._update_tray_icon()
 
     def open_settings(self):
         dlg = SettingsDialog(self.cfg, parent=None, follow_status=self.timezone_follower.status)

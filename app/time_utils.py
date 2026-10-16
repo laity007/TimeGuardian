@@ -4,7 +4,8 @@ import os
 import struct
 import subprocess
 import sys
-from typing import List, Optional, Tuple, Dict, Set
+import time
+from typing import List, Optional, Tuple, Dict, Set, NamedTuple
 from PySide6.QtCore import QTimeZone
 
 
@@ -24,17 +25,31 @@ class SYSTEMTIME(ctypes.Structure):
 def is_windows() -> bool:
     return os.name == "nt"
 
-def set_system_time_utc_via_helper(target_epoch_ms: int, allow_elevation: bool = False) -> Tuple[bool, str]:
+class ClockCorrectionResult(NamedTuple):
+    applied: bool
+    message: str
+    status: str
+
+
+def clock_deviation_text(offset_ms: float) -> str:
+    if abs(offset_ms) < 1:
+        return "本机时间与服务器基本一致"
+    direction = "快" if offset_ms < 0 else "慢"
+    return f"本机{direction}约 {abs(offset_ms) / 1000:.2f} 秒"
+
+
+def set_system_time_utc_via_helper(target_epoch_ms: int, allow_elevation: bool = False) -> ClockCorrectionResult:
+    measured_at = time.monotonic()
     from elevated_time_setter import set_system_time_utc
     try:
         if set_system_time_utc(target_epoch_ms):
-            return True, "系统时间已校准。"
+            return ClockCorrectionResult(True, "系统时间已校准。", "ok")
     except (OSError, ValueError, OverflowError) as error:
-        return False, f"校时失败：{error}"
+        return ClockCorrectionResult(False, f"校时失败：{error}", "error")
     if not allow_elevation:
-        return False, "自动校时未执行：当前权限不足。可使用 Windows 自动校时，或主动点击“立即校时”授权；后台不会弹出权限请求。"
+        return ClockCorrectionResult(False, "当前权限不足，等待授权；后台不会弹出权限请求。", "permission_required")
     if getattr(sys, "frozen", False):
-        return False, "当前打包版本无法单独启动校时辅助程序，请使用 Windows 设置中的“立即同步”。"
+        return ClockCorrectionResult(False, "当前打包版本无法单独启动校时辅助程序，请使用 Windows 设置中的“立即同步”。", "error")
     helper = os.path.join(os.path.dirname(sys.argv[0]), "elevated_time_setter.py")
     if not os.path.isfile(helper):
         candidate = os.path.join(os.path.dirname(__file__), "..", "elevated_time_setter.py")
@@ -42,9 +57,10 @@ def set_system_time_utc_via_helper(target_epoch_ms: int, allow_elevation: bool =
         if os.path.isfile(candidate):
             helper = candidate
     if not os.path.isfile(helper):
-        return False, "未找到校时所需的管理员权限辅助程序。"
+        return ClockCorrectionResult(False, "未找到校时所需的管理员权限辅助程序。", "error")
     python_exe = os.path.join(os.path.dirname(sys.executable), "python.exe")
-    arguments = subprocess.list2cmdline([helper, "--set-utc-epoch-ms", str(target_epoch_ms)])
+    arguments = subprocess.list2cmdline([helper, "--set-utc-epoch-ms", str(target_epoch_ms),
+                                        "--measured-at-monotonic", str(measured_at)])
     def ps_quote(value):
         return "'" + value.replace("'", "''") + "'"
     cmd = [
@@ -61,14 +77,14 @@ def set_system_time_utc_via_helper(target_epoch_ms: int, allow_elevation: bool =
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
                                 creationflags=subprocess.CREATE_NO_WINDOW)
         if result.returncode == 0:
-            return True, "系统时间已校准。"
+            return ClockCorrectionResult(True, "系统时间已校准。", "ok")
         if result.returncode == 1223:
-            return False, "已取消校时授权，后台不会重试提权。"
-        return False, "未能完成授权校时，请确认是否取消了权限请求，或使用 Windows 设置中的“立即同步”。"
+            return ClockCorrectionResult(False, "已取消本次校时授权，不会自动重试。", "cancelled")
+        return ClockCorrectionResult(False, "未能完成授权校时，请确认是否取消了权限请求，或使用 Windows 设置中的“立即同步”。", "error")
     except subprocess.TimeoutExpired:
-        return False, "请求管理员权限超时，请重试。"
+        return ClockCorrectionResult(False, "请求管理员权限超时，请重试。", "error")
     except Exception as e:
-        return False, f"无法请求管理员权限： {e}"
+        return ClockCorrectionResult(False, f"无法请求管理员权限： {e}", "error")
 
 def list_windows_timezones() -> List[str]:
     try:

@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QPointF, QRectF
 _connected_icon_cache: Optional[QIcon] = None
 _disconnected_icon_cache: Optional[QIcon] = None
 _idle_icon_cache: Optional[QIcon] = None
+_pending_icon_cache: Optional[QIcon] = None
 _logo_icon_cache: Optional[QIcon] = None
 _github_icon_cache: Optional[QIcon] = None
 _star_icon_cache: Optional[QIcon] = None
@@ -158,6 +159,13 @@ def idle_icon() -> QIcon:
     if _idle_icon_cache is None:
         _idle_icon_cache = _make_status_icon(QColor("#1565C0"), QColor("#FFFFFF"), "idle-dot")  # refined blue
     return _idle_icon_cache
+
+
+def pending_icon() -> QIcon:
+    global _pending_icon_cache
+    if _pending_icon_cache is None:
+        _pending_icon_cache = _make_status_icon(QColor("#D97706"), QColor("#FFFFFF"), "idle-dot")
+    return _pending_icon_cache
 
 def _load_logo_icon() -> Optional[QIcon]:
     """

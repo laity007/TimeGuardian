@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('elevated_time_setter.py', '.'), ('logo.png', '.')]
+datas = [('elevated_time_setter.py', '.'), ('logo.png', '.'), ('scripts/Enable-WindowsTime.ps1', 'scripts')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('PySide6')
